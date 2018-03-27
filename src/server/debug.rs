@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 use std::sync::Arc;
 use storage::{is_short_value, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use storage::mvcc::{Lock, Write, WriteType};
+use storage::mvcc::{Lock, Write, WriteType, LockType};
 use storage::types::{truncate_ts, Key};
 use util::config::ReadableSize;
 use util::escape;
@@ -281,6 +281,9 @@ impl Debugger {
         let mut write_opts = WriteOptions::new();
         write_opts.set_sync(true);
         box_try!(db.write_opt(wb, &write_opts));
+
+        println!("total fix write: {}, lock: {}", region_verifier.write_fix_count, region_verifier.lock_fix_count);
+
         Ok(())
     }
 
@@ -375,6 +378,8 @@ pub struct RegionVerifier {
     lock_iter: DBIterator,
     //    default_iter: DBIterator,
     write_iter: DBIterator,
+    write_fix_count: usize,
+    lock_fix_count: usize,
 }
 
 impl RegionVerifier {
@@ -397,6 +402,8 @@ impl RegionVerifier {
             write_iter: gen_iter(CF_WRITE)?,
             lock_iter: gen_iter(CF_LOCK)?,
             //            default_iter: gen_iter(CF_DEFAULT)?,
+            write_fix_count: 0,
+            lock_fix_count: 0,
         })
     }
 
@@ -411,10 +418,12 @@ impl RegionVerifier {
                 let key = iter.key().to_vec();
                 let value = iter.value().to_vec();
                 let write = box_try!(Write::parse(&value));
-                if write.short_value == None {
-                    if let Ok(None) = self.db.get_cf(default_handle, key.as_ref()) {
+                if write.short_value == None && write.write_type == WriteType::Put {
+                    let default_key = box_try!(Key::from_encoded(key.clone()).truncate_ts()).append_ts(write.start_ts);
+                    if let Ok(None) = self.db.get_cf(default_handle, default_key.encoded()) {
                         println!("delete key {:?} in write cf", key.clone());
                         box_try!(wb.delete_cf(write_handle, key.as_ref()));
+                        self.write_fix_count += 1;
                     }
                 }
 
@@ -437,10 +446,12 @@ impl RegionVerifier {
                 let key = iter.key().to_vec();
                 let value = iter.value().to_vec();
                 let lock = box_try!(Lock::parse(&value));
-                if lock.short_value == None {
-                    if let Ok(None) = self.db.get_cf(default_handle, key.as_ref()) {
+                if lock.short_value == None && lock.lock_type == LockType::Put {
+                    let default_key = Key::from_encoded(key.clone()).append_ts(lock.ts);
+                    if let Ok(None) = self.db.get_cf(default_handle, default_key.encoded()) {
                         println!("delete key {:?} in lock cf", key.clone());
                         box_try!(wb.delete_cf(lock_handle, key.as_ref()));
+                        self.lock_fix_count += 1;
                     }
                 }
 
