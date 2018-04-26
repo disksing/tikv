@@ -449,7 +449,15 @@ impl Drop for RequestTracker {
             .observe(self.exec_metrics.cf_stats.total_op_count() as f64);
 
         let exec_metrics = mem::replace(&mut self.exec_metrics, ExecutorMetrics::default());
-        cop_ctx.collect(self.region_id, self.scan_tag, exec_metrics);
+        let handle_time = self.handle_time.map_or(0, |t| (t * 1000f64) as usize);
+        let wait_time = self.wait_time.map_or(0, |t| (t * 1000f64) as usize);
+        cop_ctx.collect(
+            self.region_id,
+            self.scan_tag,
+            exec_metrics,
+            handle_time,
+            wait_time,
+        );
     }
 }
 

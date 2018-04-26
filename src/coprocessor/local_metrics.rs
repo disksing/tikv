@@ -15,30 +15,32 @@ use std::mem;
 
 use coprocessor::dag::executor::ExecutorMetrics;
 use coprocessor::metrics::*;
-use pd::PdTask;
+use pd::{PdReadStat, PdTask};
 use prometheus::local::{LocalHistogramVec, LocalIntCounterVec};
-use storage::engine::{FlowStatistics, Statistics};
 use util::collections::HashMap;
 use util::worker::FutureScheduler;
 
-/// `CopFlowStatistics` is for flow statistics, it would be reported to PD by flush.
-pub struct CopFlowStatistics {
-    data: HashMap<u64, FlowStatistics>,
+/// `CopStatistics` is for coprocessor statistics, it would be reported to PD by flush.
+pub struct CopStatistics {
+    data: HashMap<u64, PdReadStat>,
     sender: FutureScheduler<PdTask>,
 }
 
-impl CopFlowStatistics {
-    pub fn new(sender: FutureScheduler<PdTask>) -> CopFlowStatistics {
-        CopFlowStatistics {
+impl CopStatistics {
+    pub fn new(sender: FutureScheduler<PdTask>) -> CopStatistics {
+        CopStatistics {
             sender,
             data: Default::default(),
         }
     }
 
-    pub fn add(&mut self, region_id: u64, stats: &Statistics) {
-        let flow_stats = self.data.entry(region_id).or_default();
-        flow_stats.add(&stats.write.flow_stats);
-        flow_stats.add(&stats.data.flow_stats);
+    pub fn add(&mut self, region_id: u64, stats: &PdReadStat) {
+        let stat = self.data.entry(region_id).or_default();
+        stat.read_keys += stats.read_keys;
+        stat.read_bytes += stats.read_bytes;
+        stat.query_count += stats.query_count;
+        stat.query_wait += stats.query_wait;
+        stat.query_handle += stats.query_handle;
     }
 
     pub fn flush(&mut self) {
@@ -57,7 +59,7 @@ impl CopFlowStatistics {
 
 /// `ExecLocalMetrics` collects metrics for request with executors.
 pub struct ExecLocalMetrics {
-    flow_stats: CopFlowStatistics,
+    cop_stats: CopStatistics,
     scan_details: LocalIntCounterVec,
     scan_counter: LocalIntCounterVec,
     exec_counter: LocalIntCounterVec,
@@ -66,14 +68,21 @@ pub struct ExecLocalMetrics {
 impl ExecLocalMetrics {
     pub fn new(sender: FutureScheduler<PdTask>) -> ExecLocalMetrics {
         ExecLocalMetrics {
-            flow_stats: CopFlowStatistics::new(sender),
+            cop_stats: CopStatistics::new(sender),
             scan_details: COPR_SCAN_DETAILS.local(),
             scan_counter: COPR_GET_OR_SCAN_COUNT.local(),
             exec_counter: COPR_EXECUTOR_COUNT.local(),
         }
     }
 
-    pub fn collect(&mut self, type_str: &str, region_id: u64, metrics: ExecutorMetrics) {
+    pub fn collect(
+        &mut self,
+        type_str: &str,
+        region_id: u64,
+        metrics: ExecutorMetrics,
+        handle_time: usize,
+        wait_time: usize,
+    ) {
         let stats = &metrics.cf_stats;
         // cf statistics group by type
         for (cf, details) in stats.details() {
@@ -83,8 +92,15 @@ impl ExecLocalMetrics {
                     .inc_by(count as i64);
             }
         }
-        // flow statistics group by region
-        self.flow_stats.add(region_id, stats);
+        // read statistics group by region
+        let read_stats = PdReadStat {
+            read_keys: stats.write.flow_stats.read_keys + stats.data.flow_stats.read_keys,
+            read_bytes: stats.write.flow_stats.read_bytes + stats.data.flow_stats.read_bytes,
+            query_count: 1,
+            query_handle: handle_time,
+            query_wait: wait_time,
+        };
+        self.cop_stats.add(region_id, &read_stats);
         // scan count
         metrics.scan_counter.consume(&mut self.scan_counter);
         // exec count
@@ -92,7 +108,7 @@ impl ExecLocalMetrics {
     }
 
     pub fn flush(&mut self) {
-        self.flow_stats.flush();
+        self.cop_stats.flush();
         self.scan_details.flush();
         self.scan_counter.flush();
         self.exec_counter.flush();

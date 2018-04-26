@@ -21,7 +21,7 @@ pub mod pd;
 pub use self::client::RpcClient;
 pub use self::config::Config;
 pub use self::errors::{Error, Result};
-pub use self::pd::{Runner as PdRunner, Task as PdTask};
+pub use self::pd::{ReadStat as PdReadStat, Runner as PdRunner, Task as PdTask};
 pub use self::util::RECONNECT_INTERVAL_SEC;
 pub use self::util::validate_endpoints;
 
@@ -43,6 +43,8 @@ pub struct RegionStat {
     pub read_bytes: u64,
     pub read_keys: u64,
     pub approximate_size: u64,
+    pub query_count: u64,
+    pub query_handle: u64,
     pub last_report_ts: u64,
 }
 

@@ -300,6 +300,8 @@ impl PdClient for RpcClient {
         req.set_bytes_read(region_stat.read_bytes);
         req.set_keys_read(region_stat.read_bytes);
         req.set_approximate_size(region_stat.approximate_size);
+        req.set_query_count(region_stat.query_count);
+        req.set_query_handle_time(region_stat.query_handle);
         let mut interval = pdpb::TimeInterval::new();
         interval.set_start_timestamp(region_stat.last_report_ts);
         interval.set_end_timestamp(time_now_sec());

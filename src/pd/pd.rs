@@ -32,7 +32,6 @@ use raftstore::store::Callback;
 use raftstore::store::Msg;
 use raftstore::store::store::StoreInfo;
 use raftstore::store::util::{get_region_approximate_size, is_epoch_stale};
-use storage::FlowStatistics;
 use util::collections::HashMap;
 use util::escape;
 use util::rocksdb::*;
@@ -73,39 +72,72 @@ pub enum Task {
         merge_source: Option<u64>,
     },
     ReadStats {
-        read_stats: HashMap<u64, FlowStatistics>,
+        read_stats: HashMap<u64, ReadStat>,
     },
     DestroyPeer {
         region_id: u64,
     },
 }
 
+#[derive(Debug)]
+pub struct ReadStat {
+    pub read_keys: usize,
+    pub read_bytes: usize,
+    pub query_count: usize,
+    pub query_handle: usize,
+    pub query_wait: usize,
+}
+
+impl Default for ReadStat {
+    fn default() -> ReadStat {
+        ReadStat {
+            read_keys: 0,
+            read_bytes: 0,
+            query_count: 0,
+            query_handle: 0,
+            query_wait: 0,
+        }
+    }
+}
+
 pub struct StoreStat {
     pub engine_total_bytes_read: u64,
-    pub engine_total_keys_read: u64,
     pub engine_last_total_bytes_read: u64,
+    pub engine_total_keys_read: u64,
     pub engine_last_total_keys_read: u64,
-    pub last_report_ts: u64,
+
+    pub total_query_count: u64,
+    pub last_total_query_count: u64,
+    pub total_query_read: u64,
+    pub last_total_query_read: u64,
 
     pub region_bytes_read: LocalHistogram,
     pub region_keys_read: LocalHistogram,
     pub region_bytes_written: LocalHistogram,
     pub region_keys_written: LocalHistogram,
+
+    pub last_report_ts: u64,
 }
 
 impl Default for StoreStat {
     fn default() -> StoreStat {
         StoreStat {
+            engine_total_bytes_read: 0,
+            engine_total_keys_read: 0,
+            engine_last_total_bytes_read: 0,
+            engine_last_total_keys_read: 0,
+
+            total_query_count: 0,
+            total_query_read: 0,
+            last_total_query_count: 0,
+            last_total_query_read: 0,
+
             region_bytes_read: REGION_READ_BYTES_HISTOGRAM.local(),
             region_keys_read: REGION_READ_KEYS_HISTOGRAM.local(),
             region_bytes_written: REGION_WRITTEN_BYTES_HISTOGRAM.local(),
             region_keys_written: REGION_WRITTEN_KEYS_HISTOGRAM.local(),
 
             last_report_ts: 0,
-            engine_total_bytes_read: 0,
-            engine_total_keys_read: 0,
-            engine_last_total_bytes_read: 0,
-            engine_last_total_keys_read: 0,
         }
     }
 }
@@ -113,9 +145,14 @@ impl Default for StoreStat {
 #[derive(Default)]
 pub struct PeerStat {
     pub read_bytes: u64,
-    pub read_keys: u64,
     pub last_read_bytes: u64,
+    pub read_keys: u64,
     pub last_read_keys: u64,
+    pub query_count: u64,
+    pub last_query_count: u64,
+    pub query_handle: u64,
+    pub last_query_process: u64,
+
     pub last_written_bytes: u64,
     pub last_written_keys: u64,
     pub last_report_ts: u64,
@@ -318,7 +355,18 @@ impl<T: PdClient> Runner<T> {
         stats.set_interval(interval);
         self.store_stat.engine_last_total_bytes_read = self.store_stat.engine_total_bytes_read;
         self.store_stat.engine_last_total_keys_read = self.store_stat.engine_total_keys_read;
+
+        stats.set_query_count(
+            self.store_stat.total_query_count - self.store_stat.last_total_query_count,
+        );
+        stats.set_query_wait_time(
+            self.store_stat.total_query_read - self.store_stat.last_total_query_read,
+        );
+        self.store_stat.last_total_query_count = self.store_stat.total_query_count;
+        self.store_stat.last_total_query_read = self.store_stat.total_query_read;
+
         self.store_stat.last_report_ts = time_now_sec();
+
         self.store_stat.region_bytes_written.flush();
         self.store_stat.region_keys_written.flush();
         self.store_stat.region_bytes_read.flush();
@@ -493,15 +541,19 @@ impl<T: PdClient> Runner<T> {
         self.is_hb_receiver_scheduled = true;
     }
 
-    fn handle_read_stats(&mut self, read_stats: HashMap<u64, FlowStatistics>) {
+    fn handle_read_stats(&mut self, read_stats: HashMap<u64, ReadStat>) {
         for (region_id, stats) in read_stats {
             let peer_stat = self.region_peers
                 .entry(region_id)
                 .or_insert_with(PeerStat::default);
             peer_stat.read_bytes += stats.read_bytes as u64;
             peer_stat.read_keys += stats.read_keys as u64;
+            peer_stat.query_count += stats.query_count as u64;
+            peer_stat.query_handle += stats.query_handle as u64;
             self.store_stat.engine_total_bytes_read += stats.read_bytes as u64;
             self.store_stat.engine_total_keys_read += stats.read_keys as u64;
+            self.store_stat.total_query_count += stats.query_count as u64;
+            self.store_stat.total_query_read += stats.query_wait as u64;
         }
     }
 
@@ -547,6 +599,8 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
                     read_keys_delta,
                     written_bytes_delta,
                     written_keys_delta,
+                    query_count_delta,
+                    query_handle_delta,
                     last_report_ts,
                 ) = {
                     let peer_stat = self.region_peers
@@ -556,17 +610,23 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
                     let read_keys_delta = peer_stat.read_keys - peer_stat.last_read_keys;
                     let written_bytes_delta = written_bytes - peer_stat.last_written_bytes;
                     let written_keys_delta = written_keys - peer_stat.last_written_keys;
+                    let query_count_delta = peer_stat.query_count - peer_stat.last_query_count;
+                    let query_handle_delta = peer_stat.query_handle - peer_stat.last_query_process;
                     let last_report_ts = peer_stat.last_report_ts;
                     peer_stat.last_written_bytes = written_bytes;
                     peer_stat.last_written_keys = written_keys;
                     peer_stat.last_read_bytes = peer_stat.read_bytes;
                     peer_stat.last_read_keys = peer_stat.read_keys;
+                    peer_stat.last_query_count = peer_stat.query_count;
+                    peer_stat.last_query_process = peer_stat.query_handle;
                     peer_stat.last_report_ts = time_now_sec();
                     (
                         read_bytes_delta,
                         read_keys_delta,
                         written_bytes_delta,
                         written_keys_delta,
+                        query_count_delta,
+                        query_handle_delta,
                         last_report_ts,
                     )
                 };
@@ -582,6 +642,8 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
                         read_bytes: read_bytes_delta,
                         read_keys: read_keys_delta,
                         approximate_size,
+                        query_count: query_count_delta,
+                        query_handle: query_handle_delta,
                         last_report_ts,
                     },
                 )

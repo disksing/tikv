@@ -36,7 +36,7 @@ pub struct Context {
     command_pri_counter: LocalIntCounterVec,
     scan_details: LocalIntCounterVec,
 
-    read_flow_stats: HashMap<u64, storage::FlowStatistics>,
+    read_stats: HashMap<u64, pd::PdReadStat>,
 }
 
 impl fmt::Debug for Context {
@@ -55,7 +55,7 @@ impl Context {
             command_counter: KV_COMMAND_COUNTER_VEC.local(),
             command_pri_counter: SCHED_COMMANDS_PRI_COUNTER_VEC.local(),
             scan_details: KV_COMMAND_SCAN_DETAILS.local(),
-            read_flow_stats: HashMap::default(),
+            read_stats: HashMap::default(),
         }
     }
 
@@ -100,12 +100,14 @@ impl Context {
     }
 
     #[inline]
-    pub fn collect_read_flow(&mut self, region_id: u64, statistics: &storage::Statistics) {
-        let flow_stats = self.read_flow_stats
+    pub fn collect_read_flow(&mut self, region_id: u64, stats: &storage::Statistics) {
+        let entry = self.read_stats
             .entry(region_id)
-            .or_insert_with(storage::FlowStatistics::default);
-        flow_stats.add(&statistics.write.flow_stats);
-        flow_stats.add(&statistics.data.flow_stats);
+            .or_insert_with(pd::PdReadStat::default);
+        // TODO: trace query time for kv requests.
+        entry.read_keys += stats.write.flow_stats.read_keys + stats.data.flow_stats.read_keys;
+        entry.read_bytes += stats.write.flow_stats.read_bytes + stats.data.flow_stats.read_bytes;
+        entry.query_count += 1;
     }
 }
 
@@ -120,9 +122,9 @@ impl futurepool::Context for Context {
         self.scan_details.flush();
 
         // Report PD metrics
-        if !self.read_flow_stats.is_empty() {
+        if !self.read_stats.is_empty() {
             let mut read_stats = HashMap::default();
-            mem::swap(&mut read_stats, &mut self.read_flow_stats);
+            mem::swap(&mut read_stats, &mut self.read_stats);
             let result = self.pd_sender
                 .schedule(pd::PdTask::ReadStats { read_stats });
             if let Err(e) = result {
