@@ -22,6 +22,7 @@ use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
 use kvproto::kvrpcpb;
 use kvproto::kvrpcpb::*;
 use kvproto::raft_serverpb::*;
+use kvproto::tikvpb::*;
 use kvproto::tikvpb_grpc;
 use protobuf::RepeatedField;
 use std::iter::{self, FromIterator};
@@ -59,6 +60,497 @@ pub struct Service<T: RaftStoreRouter + 'static, E: Engine> {
 }
 
 impl<T: RaftStoreRouter + 'static, E: Engine> Service<T, E> {
+    fn get_future(&self, mut req: GetRequest) -> impl Future<Item = GetResponse, Error = Error> {
+        self.storage
+            .async_get(
+                req.take_context(),
+                Key::from_raw(req.get_key()),
+                req.get_version(),
+            )
+            .then(|v| {
+                let mut resp = GetResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    match v {
+                        Ok(Some(val)) => resp.set_value(val),
+                        Ok(None) => (),
+                        Err(e) => resp.set_error(extract_key_error(&e)),
+                    }
+                }
+                Ok(resp)
+            })
+    }
+
+    fn scan_future(&self, mut req: ScanRequest) -> impl Future<Item = ScanResponse, Error = Error> {
+        let mut options = Options::default();
+        options.key_only = req.get_key_only();
+        options.reverse_scan = req.get_reverse();
+        self.storage
+            .async_scan(
+                req.take_context(),
+                Key::from_raw(req.get_start_key()),
+                req.get_limit() as usize,
+                req.get_version(),
+                options,
+            )
+            .then(|v| {
+                let mut resp = ScanResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                Ok(resp)
+            })
+    }
+
+    fn prewrite_future(
+        &self,
+        mut req: PrewriteRequest,
+    ) -> impl Future<Item = PrewriteResponse, Error = Error> {
+        let mutations = req
+            .take_mutations()
+            .into_iter()
+            .map(|mut x| match x.get_op() {
+                Op::Put => Mutation::Put((Key::from_raw(x.get_key()), x.take_value())),
+                Op::Del => Mutation::Delete(Key::from_raw(x.get_key())),
+                Op::Lock => Mutation::Lock(Key::from_raw(x.get_key())),
+                _ => panic!("mismatch Op in prewrite mutations"),
+            })
+            .collect();
+        let mut options = Options::default();
+        options.lock_ttl = req.get_lock_ttl();
+        options.skip_constraint_check = req.get_skip_constraint_check();
+
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_prewrite(
+            // FIXME: handle send error.
+            req.take_context(),
+            mutations,
+            req.take_primary_lock(),
+            req.get_start_version(),
+            options,
+            cb,
+        );
+        future.map_err(Error::from).map(|v| {
+            let mut resp = PrewriteResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else {
+                resp.set_errors(RepeatedField::from_vec(extract_key_errors(v)));
+            }
+            resp
+        })
+    }
+
+    fn commit_future(
+        &self,
+        mut req: CommitRequest,
+    ) -> impl Future<Item = CommitResponse, Error = Error> {
+        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_commit(
+            // FIXME: handle send error.
+            req.take_context(),
+            keys,
+            req.get_start_version(),
+            req.get_commit_version(),
+            cb,
+        );
+        future.map_err(Error::from).map(|v| {
+            let mut resp = CommitResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(extract_key_error(&e));
+            }
+            resp
+        })
+    }
+
+    fn cleanup_future(
+        &self,
+        mut req: CleanupRequest,
+    ) -> impl Future<Item = CleanupResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_cleanup(
+            // FIXME: handle send error.
+            req.take_context(),
+            Key::from_raw(req.get_key()),
+            req.get_start_version(),
+            cb,
+        );
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = CleanupResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                if let Some(ts) = extract_committed(&e) {
+                    resp.set_commit_version(ts);
+                } else {
+                    resp.set_error(extract_key_error(&e));
+                }
+            }
+            resp
+        })
+    }
+    fn batch_get_future(
+        &self,
+        mut req: BatchGetRequest,
+    ) -> impl Future<Item = BatchGetResponse, Error = Error> {
+        let keys = req
+            .get_keys()
+            .into_iter()
+            .map(|x| Key::from_raw(x))
+            .collect();
+
+        self.storage
+            .async_batch_get(req.take_context(), keys, req.get_version())
+            .then(|v| {
+                let mut resp = BatchGetResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                Ok(resp)
+            })
+    }
+    fn batch_rollback_future(
+        &self,
+        mut req: BatchRollbackRequest,
+    ) -> impl Future<Item = BatchRollbackResponse, Error = Error> {
+        let keys = req
+            .get_keys()
+            .into_iter()
+            .map(|x| Key::from_raw(x))
+            .collect();
+
+        let (cb, future) = paired_future_callback();
+        let _ = self
+            .storage
+            .async_rollback(req.take_context(), keys, req.get_start_version(), cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = BatchRollbackResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(extract_key_error(&e));
+            }
+            resp
+        })
+    }
+    fn scan_lock_future(
+        &self,
+        mut req: ScanLockRequest,
+    ) -> impl Future<Item = ScanLockResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_scan_locks(
+            // FIXME: handle send error.
+            req.take_context(),
+            req.get_max_version(),
+            req.take_start_key(),
+            req.get_limit() as usize,
+            cb,
+        );
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = ScanLockResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else {
+                match v {
+                    Ok(locks) => resp.set_locks(RepeatedField::from_vec(locks)),
+                    Err(e) => resp.set_error(extract_key_error(&e)),
+                }
+            }
+            resp
+        })
+    }
+    fn resolve_lock_future(
+        &self,
+        mut req: ResolveLockRequest,
+    ) -> impl Future<Item = ResolveLockResponse, Error = Error> {
+        let txn_status = if req.get_start_version() > 0 {
+            HashMap::from_iter(iter::once((
+                req.get_start_version(),
+                req.get_commit_version(),
+            )))
+        } else {
+            HashMap::from_iter(
+                req.take_txn_infos()
+                    .into_iter()
+                    .map(|info| (info.txn, info.status)),
+            )
+        };
+
+        let (cb, future) = paired_future_callback();
+        let _ = self
+            .storage
+            .async_resolve_lock(req.take_context(), txn_status, cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = ResolveLockResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(extract_key_error(&e));
+            }
+            resp
+        })
+    }
+    fn gc_future(&self, mut req: GCRequest) -> impl Future<Item = GCResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self
+            .storage
+            .async_gc(req.take_context(), req.get_safe_point(), cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = GCResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(extract_key_error(&e));
+            }
+            resp
+        })
+    }
+    fn delete_range_future(
+        &self,
+        mut req: DeleteRangeRequest,
+    ) -> impl Future<Item = DeleteRangeResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_delete_range(
+            // FIXME: handle send error.
+            req.take_context(),
+            Key::from_raw(req.get_start_key()),
+            Key::from_raw(req.get_end_key()),
+            cb,
+        );
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = DeleteRangeResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn raw_get_future(
+        &self,
+        mut req: RawGetRequest,
+    ) -> impl Future<Item = RawGetResponse, Error = Error> {
+        self.storage
+            .async_raw_get(req.take_context(), req.take_cf(), req.take_key())
+            .then(|v| {
+                let mut resp = RawGetResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    match v {
+                        Ok(Some(val)) => resp.set_value(val),
+                        Ok(None) => {}
+                        Err(e) => resp.set_error(format!("{}", e)),
+                    }
+                }
+                Ok(resp)
+            })
+    }
+    fn raw_batch_get_future(
+        &self,
+        mut req: RawBatchGetRequest,
+    ) -> impl Future<Item = RawBatchGetResponse, Error = Error> {
+        let keys = req.take_keys().into_vec();
+        self.storage
+            .async_raw_batch_get(req.take_context(), req.take_cf(), keys)
+            .then(|v| {
+                let mut resp = RawBatchGetResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                Ok(resp)
+            })
+    }
+    fn raw_put_future(
+        &self,
+        mut req: RawPutRequest,
+    ) -> impl Future<Item = RawPutResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_raw_put(
+            // FIXME: handle send error.
+            req.take_context(),
+            req.take_cf(),
+            req.take_key(),
+            req.take_value(),
+            cb,
+        );
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = RawPutResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn raw_batch_put_future(
+        &self,
+        mut req: RawBatchPutRequest,
+    ) -> impl Future<Item = RawBatchPutResponse, Error = Error> {
+        let pairs = req
+            .take_pairs()
+            .into_iter()
+            .map(|mut x| (x.take_key(), x.take_value()))
+            .collect();
+        let (cb, future) = paired_future_callback();
+        let _ = self
+            .storage
+            .async_raw_batch_put(req.take_context(), req.take_cf(), pairs, cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = RawBatchPutResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn raw_delete_future(
+        &self,
+        mut req: RawDeleteRequest,
+    ) -> impl Future<Item = RawDeleteResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ =
+            self.storage
+                .async_raw_delete(req.take_context(), req.take_cf(), req.take_key(), cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = RawDeleteResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn raw_batch_delete_future(
+        &self,
+        mut req: RawBatchDeleteRequest,
+    ) -> impl Future<Item = RawBatchDeleteResponse, Error = Error> {
+        let keys = req.take_keys().into_vec();
+        let (cb, future) = paired_future_callback();
+        let _ = self
+            .storage
+            .async_raw_batch_delete(req.take_context(), req.take_cf(), keys, cb); // FIXME: handle send error.
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = RawBatchDeleteResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn raw_scan_future(
+        &self,
+        mut req: RawScanRequest,
+    ) -> impl Future<Item = RawScanResponse, Error = Error> {
+        self.storage
+            .async_raw_scan(
+                req.take_context(),
+                req.take_cf(),
+                req.take_start_key(),
+                req.get_limit() as usize,
+                req.get_key_only(),
+            )
+            .then(|v| {
+                let mut resp = RawScanResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_kvs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                Ok(resp)
+            })
+    }
+    fn raw_batch_scan_future(
+        &self,
+        mut req: RawBatchScanRequest,
+    ) -> impl Future<Item = RawBatchScanResponse, Error = Error> {
+        self.storage
+            .async_raw_batch_scan(
+                req.take_context(),
+                req.take_cf(),
+                req.take_ranges().into_vec(),
+                req.get_each_limit() as usize,
+                req.get_key_only(),
+            )
+            .then(|v| {
+                let mut resp = RawBatchScanResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else {
+                    resp.set_kvs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                }
+                Ok(resp)
+            })
+    }
+    fn raw_delete_range_future(
+        &self,
+        mut req: RawDeleteRangeRequest,
+    ) -> impl Future<Item = RawDeleteRangeResponse, Error = Error> {
+        let (cb, future) = paired_future_callback();
+        let _ = self.storage.async_raw_delete_range(
+            // FIXME: handle send error.
+            req.take_context(),
+            req.take_cf(),
+            req.take_start_key(),
+            req.take_end_key(),
+            cb,
+        );
+
+        future.map_err(Error::from).map(|v| {
+            let mut resp = RawDeleteRangeResponse::new();
+            if let Some(err) = extract_region_error(&v) {
+                resp.set_region_error(err);
+            } else if let Err(e) = v {
+                resp.set_error(format!("{}", e));
+            }
+            resp
+        })
+    }
+    fn cop_future(
+        &self,
+        peer: String,
+        req: Request,
+    ) -> impl Future<Item = Response, Error = Error> {
+        let (tx, rx) = oneshot::channel();
+        let on_resp = OnResponse::Unary(tx);
+        match RequestTask::new(peer, req, on_resp, self.recursion_limit) {
+            Ok(req_task) => {
+                let _ = self
+                    .end_point_scheduler
+                    .schedule(EndPointTask::Request(req_task)); // FIXME: handle error.
+            }
+            Err(_) => {} //FIXME: handle error.
+        };
+        rx.map_err(Error::from)
+    }
+
     pub fn new(
         storage: Storage<E>,
         end_point_scheduler: Scheduler<EndPointTask<E>>,
@@ -101,29 +593,11 @@ impl<T: RaftStoreRouter + 'static, E: Engine> Service<T, E> {
 }
 
 impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E> {
-    fn kv_get(&self, ctx: RpcContext, mut req: GetRequest, sink: UnarySink<GetResponse>) {
+    fn kv_get(&self, ctx: RpcContext, req: GetRequest, sink: UnarySink<GetResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_get.start_coarse_timer();
 
         let future = self
-            .storage
-            .async_get(
-                req.take_context(),
-                Key::from_raw(req.get_key()),
-                req.get_version(),
-            )
-            .then(|v| {
-                let mut resp = GetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(Some(val)) => resp.set_value(val),
-                        Ok(None) => (),
-                        Err(e) => resp.set_error(extract_key_error(&e)),
-                    }
-                }
-                Ok(resp)
-            })
+            .get_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -134,31 +608,10 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn kv_scan(&self, ctx: RpcContext, mut req: ScanRequest, sink: UnarySink<ScanResponse>) {
+    fn kv_scan(&self, ctx: RpcContext, req: ScanRequest, sink: UnarySink<ScanResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_scan.start_coarse_timer();
-
-        let mut options = Options::default();
-        options.key_only = req.get_key_only();
-        options.reverse_scan = req.get_reverse();
-
         let future = self
-            .storage
-            .async_scan(
-                req.take_context(),
-                Key::from_raw(req.get_start_key()),
-                req.get_limit() as usize,
-                req.get_version(),
-                options,
-            )
-            .then(|v| {
-                let mut resp = ScanResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                Ok(resp)
-            })
+            .scan_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -172,50 +625,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_prewrite(
         &self,
         ctx: RpcContext,
-        mut req: PrewriteRequest,
+        req: PrewriteRequest,
         sink: UnarySink<PrewriteResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_prewrite.start_coarse_timer();
-
-        let mutations = req
-            .take_mutations()
-            .into_iter()
-            .map(|mut x| match x.get_op() {
-                Op::Put => Mutation::Put((Key::from_raw(x.get_key()), x.take_value())),
-                Op::Del => Mutation::Delete(Key::from_raw(x.get_key())),
-                Op::Lock => Mutation::Lock(Key::from_raw(x.get_key())),
-                _ => panic!("mismatch Op in prewrite mutations"),
-            })
-            .collect();
-        let mut options = Options::default();
-        options.lock_ttl = req.get_lock_ttl();
-        options.skip_constraint_check = req.get_skip_constraint_check();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_prewrite(
-            req.take_context(),
-            mutations,
-            req.take_primary_lock(),
-            req.get_start_version(),
-            options,
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = PrewriteResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_errors(RepeatedField::from_vec(extract_key_errors(v)));
-                }
-                resp
-            })
+        let future = self
+            .prewrite_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -226,35 +641,11 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn kv_commit(&self, ctx: RpcContext, mut req: CommitRequest, sink: UnarySink<CommitResponse>) {
+    fn kv_commit(&self, ctx: RpcContext, req: CommitRequest, sink: UnarySink<CommitResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_commit.start_coarse_timer();
 
-        let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_commit(
-            req.take_context(),
-            keys,
-            req.get_start_version(),
-            req.get_commit_version(),
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = CommitResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
+        let future = self
+            .commit_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -269,41 +660,10 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         unimplemented!();
     }
 
-    fn kv_cleanup(
-        &self,
-        ctx: RpcContext,
-        mut req: CleanupRequest,
-        sink: UnarySink<CleanupResponse>,
-    ) {
+    fn kv_cleanup(&self, ctx: RpcContext, req: CleanupRequest, sink: UnarySink<CleanupResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_cleanup.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_cleanup(
-            req.take_context(),
-            Key::from_raw(req.get_key()),
-            req.get_start_version(),
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = CleanupResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    if let Some(ts) = extract_committed(&e) {
-                        resp.set_commit_version(ts);
-                    } else {
-                        resp.set_error(extract_key_error(&e));
-                    }
-                }
-                resp
-            })
+        let future = self
+            .cleanup_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -317,29 +677,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_batch_get(
         &self,
         ctx: RpcContext,
-        mut req: BatchGetRequest,
+        req: BatchGetRequest,
         sink: UnarySink<BatchGetResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_batch_get.start_coarse_timer();
-
-        let keys = req
-            .get_keys()
-            .into_iter()
-            .map(|x| Key::from_raw(x))
-            .collect();
-
         let future = self
-            .storage
-            .async_batch_get(req.take_context(), keys, req.get_version())
-            .then(|v| {
-                let mut resp = BatchGetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                Ok(resp)
-            })
+            .batch_get_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -353,39 +696,14 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_batch_rollback(
         &self,
         ctx: RpcContext,
-        mut req: BatchRollbackRequest,
+        req: BatchRollbackRequest,
         sink: UnarySink<BatchRollbackResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC
             .kv_batch_rollback
             .start_coarse_timer();
-
-        let keys = req
-            .get_keys()
-            .into_iter()
-            .map(|x| Key::from_raw(x))
-            .collect();
-
-        let (cb, future) = paired_future_callback();
-        let res =
-            self.storage
-                .async_rollback(req.take_context(), keys, req.get_start_version(), cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = BatchRollbackResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
+        let future = self
+            .batch_rollback_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -399,38 +717,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_scan_lock(
         &self,
         ctx: RpcContext,
-        mut req: ScanLockRequest,
+        req: ScanLockRequest,
         sink: UnarySink<ScanLockResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_scan_lock.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_scan_locks(
-            req.take_context(),
-            req.get_max_version(),
-            req.take_start_key(),
-            req.get_limit() as usize,
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = ScanLockResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(locks) => resp.set_locks(RepeatedField::from_vec(locks)),
-                        Err(e) => resp.set_error(extract_key_error(&e)),
-                    }
-                }
-                resp
-            })
+        let future = self
+            .scan_lock_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -444,44 +736,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_resolve_lock(
         &self,
         ctx: RpcContext,
-        mut req: ResolveLockRequest,
+        req: ResolveLockRequest,
         sink: UnarySink<ResolveLockResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_resolve_lock.start_coarse_timer();
-
-        let txn_status = if req.get_start_version() > 0 {
-            HashMap::from_iter(iter::once((
-                req.get_start_version(),
-                req.get_commit_version(),
-            )))
-        } else {
-            HashMap::from_iter(
-                req.take_txn_infos()
-                    .into_iter()
-                    .map(|info| (info.txn, info.status)),
-            )
-        };
-
-        let (cb, future) = paired_future_callback();
-        let res = self
-            .storage
-            .async_resolve_lock(req.take_context(), txn_status, cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = ResolveLockResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
+        let future = self
+            .resolve_lock_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -492,29 +752,10 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn kv_gc(&self, ctx: RpcContext, mut req: GCRequest, sink: UnarySink<GCResponse>) {
+    fn kv_gc(&self, ctx: RpcContext, req: GCRequest, sink: UnarySink<GCResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_gc.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res = self
-            .storage
-            .async_gc(req.take_context(), req.get_safe_point(), cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = GCResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
+        let future = self
+            .gc_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -529,34 +770,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn kv_delete_range(
         &self,
         ctx: RpcContext,
-        mut req: DeleteRangeRequest,
+        req: DeleteRangeRequest,
         sink: UnarySink<DeleteRangeResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.kv_delete_range.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_delete_range(
-            req.take_context(),
-            Key::from_raw(req.get_start_key()),
-            Key::from_raw(req.get_end_key()),
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = DeleteRangeResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .delete_range_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -567,25 +786,10 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn raw_get(&self, ctx: RpcContext, mut req: RawGetRequest, sink: UnarySink<RawGetResponse>) {
+    fn raw_get(&self, ctx: RpcContext, req: RawGetRequest, sink: UnarySink<RawGetResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_get.start_coarse_timer();
-
         let future = self
-            .storage
-            .async_raw_get(req.take_context(), req.take_cf(), req.take_key())
-            .then(|v| {
-                let mut resp = RawGetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(Some(val)) => resp.set_value(val),
-                        Ok(None) => {}
-                        Err(e) => resp.set_error(format!("{}", e)),
-                    }
-                }
-                Ok(resp)
-            })
+            .raw_get_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -599,24 +803,13 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_batch_get(
         &self,
         ctx: RpcContext,
-        mut req: RawBatchGetRequest,
+        req: RawBatchGetRequest,
         sink: UnarySink<RawBatchGetResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_batch_get.start_coarse_timer();
 
-        let keys = req.take_keys().into_vec();
         let future = self
-            .storage
-            .async_raw_batch_get(req.take_context(), req.take_cf(), keys)
-            .then(|v| {
-                let mut resp = RawBatchGetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                Ok(resp)
-            })
+            .raw_batch_get_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -627,27 +820,11 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn raw_scan(&self, ctx: RpcContext, mut req: RawScanRequest, sink: UnarySink<RawScanResponse>) {
+    fn raw_scan(&self, ctx: RpcContext, req: RawScanRequest, sink: UnarySink<RawScanResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_scan.start_coarse_timer();
 
         let future = self
-            .storage
-            .async_raw_scan(
-                req.take_context(),
-                req.take_cf(),
-                req.take_start_key(),
-                req.get_limit() as usize,
-                req.get_key_only(),
-            )
-            .then(|v| {
-                let mut resp = RawScanResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_kvs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                Ok(resp)
-            })
+            .raw_scan_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -661,29 +838,13 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_batch_scan(
         &self,
         ctx: RpcContext,
-        mut req: RawBatchScanRequest,
+        req: RawBatchScanRequest,
         sink: UnarySink<RawBatchScanResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_batch_scan.start_coarse_timer();
 
         let future = self
-            .storage
-            .async_raw_batch_scan(
-                req.take_context(),
-                req.take_cf(),
-                req.take_ranges().into_vec(),
-                req.get_each_limit() as usize,
-                req.get_key_only(),
-            )
-            .then(|v| {
-                let mut resp = RawBatchScanResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_kvs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                Ok(resp)
-            })
+            .raw_batch_scan_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -694,33 +855,10 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         ctx.spawn(future);
     }
 
-    fn raw_put(&self, ctx: RpcContext, mut req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
+    fn raw_put(&self, ctx: RpcContext, req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_put.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_raw_put(
-            req.take_context(),
-            req.take_cf(),
-            req.take_key(),
-            req.take_value(),
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = RawPutResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .raw_put_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -734,36 +872,13 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_batch_put(
         &self,
         ctx: RpcContext,
-        mut req: RawBatchPutRequest,
+        req: RawBatchPutRequest,
         sink: UnarySink<RawBatchPutResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_batch_put.start_coarse_timer();
 
-        let pairs = req
-            .take_pairs()
-            .into_iter()
-            .map(|mut x| (x.take_key(), x.take_value()))
-            .collect();
-        let (cb, future) = paired_future_callback();
-        let res = self
-            .storage
-            .async_raw_batch_put(req.take_context(), req.take_cf(), pairs, cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = RawBatchPutResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .raw_batch_put_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -777,31 +892,12 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_delete(
         &self,
         ctx: RpcContext,
-        mut req: RawDeleteRequest,
+        req: RawDeleteRequest,
         sink: UnarySink<RawDeleteResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_delete.start_coarse_timer();
-
-        let (cb, future) = paired_future_callback();
-        let res =
-            self.storage
-                .async_raw_delete(req.take_context(), req.take_cf(), req.take_key(), cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = RawDeleteResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .raw_delete_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -815,32 +911,13 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_batch_delete(
         &self,
         ctx: RpcContext,
-        mut req: RawBatchDeleteRequest,
+        req: RawBatchDeleteRequest,
         sink: UnarySink<RawBatchDeleteResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_batch_delete.start_coarse_timer();
 
-        let keys = req.take_keys().into_vec();
-        let (cb, future) = paired_future_callback();
-        let res = self
-            .storage
-            .async_raw_batch_delete(req.take_context(), req.take_cf(), keys, cb);
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = RawBatchDeleteResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .raw_batch_delete_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -854,35 +931,13 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
     fn raw_delete_range(
         &self,
         ctx: RpcContext,
-        mut req: RawDeleteRangeRequest,
+        req: RawDeleteRangeRequest,
         sink: UnarySink<RawDeleteRangeResponse>,
     ) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.raw_delete_range.start_coarse_timer();
 
-        let (cb, future) = paired_future_callback();
-        let res = self.storage.async_raw_delete_range(
-            req.take_context(),
-            req.take_cf(),
-            req.take_start_key(),
-            req.take_end_key(),
-            cb,
-        );
-        if let Err(e) = res {
-            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
-            return;
-        }
-
-        let future = future
-            .map_err(Error::from)
-            .map(|v| {
-                let mut resp = RawDeleteRangeResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
+        let future = self
+            .raw_delete_range_future(req)
             .and_then(|res| sink.success(res).map_err(Error::from))
             .map(|_| timer.observe_duration())
             .map_err(move |e| {
@@ -895,32 +950,8 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
 
     fn coprocessor(&self, ctx: RpcContext, req: Request, sink: UnarySink<Response>) {
         let timer = GRPC_MSG_HISTOGRAM_VEC.coprocessor.start_coarse_timer();
-
-        let (tx, rx) = oneshot::channel();
-        let on_resp = OnResponse::Unary(tx);
-        let req_task = match RequestTask::new(ctx.peer(), req, on_resp, self.recursion_limit) {
-            Ok(req_task) => req_task,
-            Err(e) => {
-                let mut metrics = BasicLocalMetrics::default();
-                let future = sink
-                    .success(err_resp(e, &mut metrics))
-                    .map(|_| timer.observe_duration())
-                    .map_err(move |e| {
-                        debug!("{} failed: {:?}", "coprocessor", e);
-                        GRPC_MSG_FAIL_COUNTER.coprocessor.inc();
-                    });
-                return ctx.spawn(future);
-            }
-        };
-
-        let task = EndPointTask::Request(req_task);
-        if let Err(e) = self.end_point_scheduler.schedule(task) {
-            let error = Error::from(e);
-            let code = RpcStatusCode::ResourceExhausted;
-            return self.send_fail_status(ctx, sink, error, code);
-        }
-
-        let future = rx
+        let future = self
+            .cop_future(ctx.peer(), req)
             .map_err(Error::from)
             .and_then(|resp| sink.success(resp).map_err(Error::from))
             .map(|_| timer.observe_duration())
@@ -1170,6 +1201,347 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
                 GRPC_MSG_FAIL_COUNTER.split_region.inc();
             });
 
+        ctx.spawn(future);
+    }
+
+    fn super_batch(
+        &self,
+        ctx: RpcContext,
+        mut req: SuperBatchRequest,
+        sink: UnarySink<SuperBatchResponse>,
+    ) {
+        let len = req.requests.len();
+        let (tx, rx) = futures_mpsc::channel(len);
+
+        for (i, r) in req.take_requests().into_iter().enumerate() {
+            let mut tx1 = tx.clone();
+            match r.cmd {
+                Some(SuperBatchRequest_Request_oneof_cmd::Get(req)) => {
+                    ctx.spawn(
+                        self.get_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::Get(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Scan(req)) => {
+                    ctx.spawn(
+                        self.scan_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::Scan(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Prewrite(req)) => {
+                    ctx.spawn(
+                        self.prewrite_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::Prewrite(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Commit(req)) => {
+                    ctx.spawn(
+                        self.commit_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::Commit(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Import(_)) => {
+                    panic!("unimplemented");
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Cleanup(req)) => {
+                    ctx.spawn(
+                        self.cleanup_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::Cleanup(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::BatchGet(req)) => {
+                    ctx.spawn(
+                        self.batch_get_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::BatchGet(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::BatchRollback(req)) => {
+                    ctx.spawn(
+                        self.batch_rollback_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::BatchRollback(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::ScanLock(req)) => {
+                    ctx.spawn(
+                        self.scan_lock_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::ScanLock(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::ResolveLock(req)) => {
+                    ctx.spawn(
+                        self.resolve_lock_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::ResolveLock(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::GC(req)) => {
+                    ctx.spawn(
+                        self.gc_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::GC(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::DeleteRange(req)) => {
+                    ctx.spawn(
+                        self.delete_range_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::DeleteRange(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawGet(req)) => {
+                    ctx.spawn(
+                        self.raw_get_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::RawGet(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawBatchGet(req)) => {
+                    ctx.spawn(
+                        self.raw_batch_get_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::RawBatchGet(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawPut(req)) => {
+                    ctx.spawn(
+                        self.raw_put_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::RawPut(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawBatchPut(req)) => {
+                    ctx.spawn(
+                        self.raw_batch_put_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::RawBatchPut(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawDelete(req)) => {
+                    ctx.spawn(
+                        self.raw_delete_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::RawDelete(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawBatchDelete(req)) => {
+                    ctx.spawn(
+                        self.raw_batch_delete_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::RawBatchDelete(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawScan(req)) => {
+                    ctx.spawn(
+                        self.raw_scan_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd = Some(SuperBatchResponse_Response_oneof_cmd::RawScan(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawDeleteRange(req)) => {
+                    ctx.spawn(
+                        self.raw_delete_range_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::RawDeleteRange(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::RawBatchScan(req)) => {
+                    ctx.spawn(
+                        self.raw_batch_scan_future(req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::RawBatchScan(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                Some(SuperBatchRequest_Request_oneof_cmd::Coprocessor(req)) => {
+                    ctx.spawn(
+                        self.cop_future(ctx.peer(), req)
+                            .map(|r| {
+                                let mut res = SuperBatchResponse_Response::new();
+                                res.cmd =
+                                    Some(SuperBatchResponse_Response_oneof_cmd::Coprocessor(r));
+                                res
+                            })
+                            .then(move |res| {
+                                let _ = tx1.start_send((i, res));
+                                future::ok(())
+                            }),
+                    );
+                }
+                _ => panic!("invalid super batch request"),
+            }
+        }
+
+        let future = rx
+            .collect()
+            .map(move |x| {
+                let mut v = Vec::with_capacity(len);
+                for (i, res) in x {
+                    match res {
+                        Ok(res) => v[i] = res,
+                        Err(_) => {} // FIXME: handle error
+                    }
+                }
+                let mut res = SuperBatchResponse::new();
+                res.set_responses(RepeatedField::from_vec(v));
+                res
+            })
+            .and_then(|res| sink.success(res).map_err(|_| ()))
+            .map(|_| ());
         ctx.spawn(future);
     }
 }
