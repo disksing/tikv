@@ -1529,7 +1529,7 @@ impl<T: RaftStoreRouter + 'static, E: Engine> tikvpb_grpc::Tikv for Service<T, E
         let future = rx
             .collect()
             .map(move |x| {
-                let mut v = Vec::with_capacity(len);
+                let mut v = vec![SuperBatchResponse_Response::new(); len];
                 for (i, res) in x {
                     match res {
                         Ok(res) => v[i] = res,
