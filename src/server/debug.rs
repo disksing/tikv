@@ -302,6 +302,43 @@ impl Debugger {
         Ok(())
     }
 
+    pub fn recover_all(&self, read_only: bool) -> Result<()> {
+        let db = &self.engines.kv_engine;
+        let mut mvcc_checker = box_try!(MvccChecker::new(
+            Arc::clone(db),
+            b"",
+            b""
+        ));
+
+        let wb_limit: usize = 10240;
+
+        loop {
+            let wb = WriteBatch::new();
+            mvcc_checker.check_mvcc_ex(&wb, wb_limit)?;
+
+            let batch_size = wb.count();
+
+            if !read_only {
+                let mut write_opts = WriteOptions::new();
+                write_opts.set_sync(true);
+                box_try!(db.write_opt(wb, &write_opts));
+            } else {
+                warn!("skip write {} rows", batch_size);
+            }
+
+            warn!(
+                "total fix default: {}, lock: {}, write: {}",
+                mvcc_checker.default_fix_count,
+                mvcc_checker.lock_fix_count,
+                mvcc_checker.write_fix_count
+            );
+
+            if batch_size < wb_limit {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn bad_regions(&self) -> Result<Vec<(u64, Error)>> {
         let mut res = Vec::new();
 
@@ -551,6 +588,24 @@ impl MvccChecker {
             match key {
                 Some(key) => self.check_mvcc_key(wb, key.as_ref())?,
                 None => return Ok(()),
+            }
+        }
+    }
+
+    pub fn check_mvcc_ex(&mut self, wb: &WriteBatch, limit: usize) -> Result<()> {
+        loop {
+            // Find min key in the 3 CFs.
+            let mut key = MvccChecker::min_key(None, &self.default_iter, truncate_ts);
+            key = MvccChecker::min_key(key, &self.lock_iter, |k| k);
+            key = MvccChecker::min_key(key, &self.write_iter, truncate_ts);
+
+            match key {
+                Some(key) => self.check_mvcc_key(wb, key.as_ref())?,
+                None => return Ok(()),
+            }
+
+            if wb.count() >= limit {
+                return Ok(());
             }
         }
     }
