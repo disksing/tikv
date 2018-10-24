@@ -292,7 +292,7 @@ impl Debugger {
         write_opts.set_sync(true);
         box_try!(db.write_opt(wb, &write_opts));
 
-        warn!(
+        println!(
             "total fix default: {}, lock: {}, write: {}",
             mvcc_checker.default_fix_count,
             mvcc_checker.lock_fix_count,
@@ -323,10 +323,10 @@ impl Debugger {
                 write_opts.set_sync(true);
                 box_try!(db.write_opt(wb, &write_opts));
             } else {
-                warn!("skip write {} rows", batch_size);
+                println!("skip write {} rows", batch_size);
             }
 
-            warn!(
+            println!(
                 "total fix default: {}, lock: {}, write: {}",
                 mvcc_checker.default_fix_count,
                 mvcc_checker.lock_fix_count,
@@ -530,6 +530,7 @@ pub struct MvccChecker {
     lock_iter: DBIterator,
     default_iter: DBIterator,
     write_iter: DBIterator,
+    scan_count: usize,
     lock_fix_count: usize,
     default_fix_count: usize,
     write_fix_count: usize,
@@ -554,6 +555,7 @@ impl MvccChecker {
             write_iter: gen_iter(CF_WRITE)?,
             lock_iter: gen_iter(CF_LOCK)?,
             default_iter: gen_iter(CF_DEFAULT)?,
+            scan_count: 0,
             lock_fix_count: 0,
             default_fix_count: 0,
             write_fix_count: 0,
@@ -611,6 +613,11 @@ impl MvccChecker {
     }
 
     fn check_mvcc_key(&mut self, wb: &WriteBatch, key: &[u8]) -> Result<()> {
+        self.scan_count += 1;
+        if self.scan_count%1_000_000 == 0 {
+            println!("scan {} rows", self.scan_count);
+        }
+
         let (mut default, mut write, mut lock) = (None, None, None);
         let (mut next_default, mut next_write, mut next_lock) = (true, true, true);
         loop {
@@ -633,7 +640,7 @@ impl MvccChecker {
                 // All write records' ts should be less than lock's ts.
                 if let Some((commit_ts, _)) = write {
                     if l.ts <= commit_ts {
-                        warn!(
+                        println!(
                             "LOCK ts is less than WRITE ts, key: {}, lock_ts: {}, commit_ts: {}",
                             escape(key),
                             l.ts,
@@ -654,7 +661,7 @@ impl MvccChecker {
                             next_default = true;
                         }
                         _ => {
-                            warn!(
+                            println!(
                                 "no corresponding DEFAULT record for LOCK, key: {}, lock_ts: {}",
                                 escape(key),
                                 l.ts
@@ -693,7 +700,7 @@ impl MvccChecker {
             }
 
             if next_default {
-                warn!(
+                println!(
                     "orphan DEFAULT record, key: {}, start_ts: {}",
                     escape(key),
                     default.unwrap()
@@ -704,7 +711,7 @@ impl MvccChecker {
 
             if next_write {
                 if let Some((commit_ts, ref w)) = write {
-                    warn!(
+                    println!(
                         "no corresponding DEFAULT record for WRITE, key: {}, start_ts: {}, commit_ts: {}",
                         escape(key),
                         w.start_ts,
