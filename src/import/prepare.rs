@@ -74,10 +74,7 @@ impl<Client: ImportClient> PrepareJob<Client> {
 
         let num_prepares = self.prepare(&props);
 
-        // PD needs some time to scatter regions. But we don't know how much
-        // time it should take, so we just calculate an approximate duration.
-        let wait_duration = Duration::from_millis(num_prepares as u64 * 100);
-        let wait_duration = cmp::min(wait_duration, self.cfg.max_prepare_duration.0);
+        let wait_duration = self.cfg.max_prepare_duration.0;
         info!(
             "prepare"; "tag" => %self.tag, "ranges" => %num_prepares, "waits" => ?wait_duration,
         );
