@@ -82,7 +82,7 @@
 # grpc-concurrent-stream = 1024
 
 ## The number of connections with each TiKV server to send Raft messages.
-# grpc-raft-conn-num = 10
+# grpc-raft-conn-num = 1
 
 ## Amount to read ahead on individual gRPC streams.
 # grpc-stream-initial-window-size = "2MB"
